@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Arrow Automaton</title>
+<style>
+:root{--bg:#f4f5f8;--panel:#fff;--text:#1b2230;--muted:#6b7488;--accent:#3b6df0;--grid:#dfe3ec;--tile:#dbe4f7;--arrow:#3b6df0;--on:#ffb703;--onarrow:#5a3a00;--line:#d3d8e4;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0f1420;--panel:#181f2f;--text:#e6eaf4;--muted:#8a94ab;--accent:#6c93ff;--grid:#1c2438;--tile:#222d47;--arrow:#6c93ff;--on:#ffd166;--onarrow:#3a2600;--line:#2a3350}}
+:root[data-theme="dark"]{--bg:#0f1420;--panel:#181f2f;--text:#e6eaf4;--muted:#8a94ab;--accent:#6c93ff;--grid:#1c2438;--tile:#222d47;--arrow:#6c93ff;--on:#ffd166;--onarrow:#3a2600;--line:#2a3350}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;overflow:hidden}
+#bar{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:10px 12px;background:var(--panel);border-bottom:1px solid var(--line)}
+.grp{display:flex;gap:4px;align-items:center}
+button{font:inherit;color:var(--text);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:6px 10px;cursor:pointer;min-width:34px}
+button:hover{border-color:var(--accent)}
+button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+label{color:var(--muted);display:flex;gap:6px;align-items:center}
+#stage{flex:1;position:relative;min-height:0}
+canvas{position:absolute;inset:0;width:100%;height:100%;touch-action:none;cursor:crosshair}
+#info{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums}
+#help{padding:6px 12px;color:var(--muted);font-size:12px;border-top:1px solid var(--line);background:var(--panel)}
+#drop{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(108,147,255,.18);border:3px dashed var(--accent);color:var(--text);font-size:20px;font-weight:600;pointer-events:none;z-index:10}
+body.dragging #drop{display:flex}
+#ced{position:absolute;width:200px;z-index:5;background:#fff3c4;color:#2b2200;border:2px solid #e0a100;border-radius:8px;padding:6px;font:13px system-ui,sans-serif;resize:none;box-sizing:border-box}
+</style>
+</head>
+<body>
+<div id="bar">
+  <div class="grp">
+    <button id="play">▶ Play</button>
+    <button id="step">Step</button>
+    <button id="clear">Clear board</button>
+    <button id="clearActive">Deactivate all</button>
+    <button id="export" hidden>Export JSON</button>
+    <button id="import">Import JSON</button>
+    <input id="file" type="file" accept=".json,application/json" hidden>
+  </div>
+  <label>Speed <input id="speed" type="range" min="1" max="30" value="6"></label>
+  <div class="grp" id="tools">
+    <button data-tool="draw" class="on">Draw</button>
+    <button data-tool="erase">Erase</button>
+    <button data-tool="comment">Comment</button>
+  </div>
+  <div class="grp" id="dirs" title="Directions for new tiles">
+    <button data-d="1">↑</button><button data-d="2">↓</button><button data-d="4">←</button><button data-d="8" class="on">→</button>
+  </div>
+  <div id="info">Gen 0 · 0 tiles · 0 active</div>
+</div>
+<div id="stage"><canvas id="c"></canvas><textarea id="ced" hidden rows="3" maxlength="500" placeholder="Comment… (Enter to save)"></textarea></div>
+<div id="drop">Drop a board JSON file to import</div>
+<div id="help">Arrow keys / WASD or arrow buttons: pick one direction · Q: draw · E: erase · C: comment (click a cell to add; click a bubble to edit, drag it to move; erase tool deletes) · U: export · I: import · Click: place a tile, or toggle that direction on an existing tile (click again with another direction to make multi-direction tiles) · Right-click / two-finger click / two-finger tap: toggle active · Hold Space (or middle-drag, right-drag): move · Wheel: zoom · P: play/pause · N: step</div>
+<script>
+const U=1,D=2,L=4,R=8;
+const DIRS=[[U,0,-1],[D,0,1],[L,-1,0],[R,1,0]];
+const tiles=new Map(); // "x,y" -> {m:mask,a:bool}
+const key=(x,y)=>x+','+y;
+const comments=new Map(); // "x,y" -> {x,y,dx,dy,text}; dx,dy = bubble offset in cells
+const bubbles=[];
+let editing=null;
+let gen=0,running=false,tool='draw',dirMask=R,timer=null,hover=null,sel=null;
+const cam={x:0,y:0,s:36};
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+let W=0,H=0,dpr=1,dirty=true;
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+function resize(){dpr=window.devicePixelRatio||1;const r=cv.getBoundingClientRect();W=r.width;H=r.height;cv.width=W*dpr;cv.height=H*dpr;dirty=true}
+addEventListener('resize',resize);
+
+function stepGen(){
+  const counts=new Map();
+  for(const [k,t] of tiles){
+    if(!t.a)continue;
+    const [x,y]=k.split(',').map(Number);
+    for(const [bit,dx,dy] of DIRS){
+      if(t.m&bit){const nk=key(x+dx,y+dy);if(tiles.has(nk))counts.set(nk,(counts.get(nk)||0)+1)}
+    }
+  }
+  for(const [k,t] of tiles)t.a=counts.get(k)===1;
+  gen++;dirty=true;updateInfo();
+}
+function updateInfo(){
+  let a=0;for(const t of tiles.values())if(t.a)a++;
+  document.getElementById('info').textContent=`Gen ${gen} · ${tiles.size} tiles · ${a} active`;
+}
+
+function draw(){
+  dirty=false;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.fillStyle=css('--bg');ctx.fillRect(0,0,W,H);
+  const s=cam.s,x0=Math.floor(cam.x-W/2/s),x1=Math.ceil(cam.x+W/2/s),y0=Math.floor(cam.y-H/2/s),y1=Math.ceil(cam.y+H/2/s);
+  const sx=x=>(x-cam.x)*s+W/2,sy=y=>(y-cam.y)*s+H/2;
+  if(s>=5){
+    ctx.strokeStyle='rgba(128,140,170,0.35)';ctx.lineWidth=1;ctx.beginPath();
+    for(let x=x0;x<=x1;x++){ctx.moveTo(sx(x)+.5,0);ctx.lineTo(sx(x)+.5,H)}
+    for(let y=y0;y<=y1;y++){ctx.moveTo(0,sy(y)+.5);ctx.lineTo(W,sy(y)+.5)}
+    ctx.stroke();
+  }
+  const tc=css('--tile'),ac=css('--arrow'),on=css('--on'),oa=css('--onarrow');
+  const pad=s>=10?1.5:0;
+  for(let y=y0;y<=y1;y++)for(let x=x0;x<=x1;x++){
+    const t=tiles.get(key(x,y));if(!t)continue;
+    const px=sx(x),py=sy(y);
+    ctx.fillStyle=t.a?on:tc;
+    ctx.fillRect(px+pad,py+pad,s-pad*2,s-pad*2);
+    if(s<8)continue;
+    ctx.fillStyle=t.a?oa:ac;
+    const cx=px+s/2,cy=py+s/2,a=s*.22,e=s*.42;
+    ctx.beginPath();
+    if(t.m&U){ctx.moveTo(cx,cy-e);ctx.lineTo(cx-a,cy-e+a*1.4);ctx.lineTo(cx+a,cy-e+a*1.4)}
+    if(t.m&D){ctx.moveTo(cx,cy+e);ctx.lineTo(cx-a,cy+e-a*1.4);ctx.lineTo(cx+a,cy+e-a*1.4)}
+    if(t.m&L){ctx.moveTo(cx-e,cy);ctx.lineTo(cx-e+a*1.4,cy-a);ctx.lineTo(cx-e+a*1.4,cy+a)}
+    if(t.m&R){ctx.moveTo(cx+e,cy);ctx.lineTo(cx+e-a*1.4,cy-a);ctx.lineTo(cx+e-a*1.4,cy+a)}
+    ctx.fill();
+  }
+  bubbles.length=0;
+  if(comments.size){
+    ctx.font='13px system-ui,sans-serif';ctx.textBaseline='top';
+    for(const c of comments.values()){
+      const ax=sx(c.x)+s/2,ay=sy(c.y)+s/2;
+      const lines=wrapText(c.text,170);
+      const w=Math.max(...lines.map(l=>ctx.measureText(l).width))+16,h=lines.length*16+10;
+      const bx=ax+c.dx*s-w/2,by=ay+c.dy*s-h/2;
+      const px=Math.min(Math.max(ax,bx),bx+w),py=Math.min(Math.max(ay,by),by+h);
+      ctx.strokeStyle='#e0a100';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(ax,ay);ctx.lineTo(px,py);ctx.stroke();
+      ctx.fillStyle='#e0a100';ctx.beginPath();ctx.arc(ax,ay,3.5,0,Math.PI*2);ctx.fill();
+      bubbles.push({c,x:bx,y:by,w,h,lines});
+    }
+    for(const b of bubbles){
+      ctx.fillStyle='#fff3c4';ctx.strokeStyle='#e0a100';ctx.lineWidth=1.5;
+      ctx.beginPath();ctx.roundRect(b.x,b.y,b.w,b.h,8);ctx.fill();ctx.stroke();
+      ctx.fillStyle='#2b2200';
+      b.lines.forEach((l,i)=>ctx.fillText(l,b.x+8,b.y+5+i*16));
+    }
+  }
+  const hl=hover||sel;
+  if(hl){
+    ctx.fillStyle='rgba(108,147,255,0.25)';
+    ctx.fillRect(sx(hl.x),sy(hl.y),s,s);
+    ctx.strokeStyle=css('--accent');ctx.lineWidth=2.5;
+    ctx.strokeRect(sx(hl.x)+1.25,sy(hl.y)+1.25,s-2.5,s-2.5);
+  }
+}
+function loop(){if(dirty)draw();requestAnimationFrame(loop)}
+
+// interaction
+var drag=null,spaceDown=false;
+const toCell=(e)=>{const r=cv.getBoundingClientRect();return{x:Math.floor((e.clientX-r.left-W/2)/cam.s+cam.x),y:Math.floor((e.clientY-r.top-H/2)/cam.s+cam.y)}};
+function toggleActive(c){const t=tiles.get(key(c.x,c.y));if(t){t.a=!t.a;dirty=true;updateInfo()}}
+function apply(c){
+  if(tool==='comment')return;
+  const k=key(c.x,c.y);
+  if(drag.lastKey===null&&!drag.undo){const o0=tiles.get(k);drag.undo={k,prev:o0?{...o0}:null}}
+  if(tool==='draw'){
+    const o=tiles.get(k);
+    if(!o){if(dirMask)tiles.set(k,{m:dirMask,a:false})}
+    else if(drag.lastKey===null){const m=o.m^dirMask;if(m)o.m=m;else tiles.delete(k)}
+  }
+  else if(tool==='erase'){tiles.delete(k);comments.delete(k)}
+  else if(tool==='spark'){const t=tiles.get(k);if(t&&drag.lastKey!==k)t.a=!t.a}
+  drag.lastKey=k;dirty=true;updateInfo();
+}
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+const ptrs=new Set();
+cv.addEventListener('pointerdown',e=>{
+  cv.setPointerCapture(e.pointerId);
+  ptrs.add(e.pointerId);
+  const c=toCell(e);sel=c;hover=c;dirty=true;
+  if(e.pointerType==='touch'&&ptrs.size>=2){
+    if(drag&&drag.undo){const u=drag.undo;if(u.prev)tiles.set(u.k,u.prev);else tiles.delete(u.k);updateInfo()}
+    drag=null;toggleActive(c);return;
+  }
+  if(e.button===2){drag={right:true,moved:false,sx:e.clientX,sy:e.clientY,px:e.clientX,py:e.clientY,c};return}
+  if(e.button===0&&!spaceDown){
+    const bc=bubbleAt(e);
+    if(bc){
+      if(tool==='erase'){comments.delete(key(bc.x,bc.y));dirty=true;return}
+      const kk=key(bc.x,bc.y);comments.delete(kk);comments.set(kk,bc);
+      drag={bubble:bc,bmoved:false,sx:e.clientX,sy:e.clientY,px:e.clientX,py:e.clientY};return;
+    }
+  }
+  const pan=e.button===1||tool==='pan'||spaceDown;
+  drag={pan,px:e.clientX,py:e.clientY,lastKey:null};
+  if(!pan){if(tool==='comment')openCommentAt(c);else apply(c)}
+});
+cv.addEventListener('pointermove',e=>{
+  hover=toCell(e);dirty=true;
+  if(!drag)return;
+  if(drag.bubble){
+    if(!drag.bmoved&&Math.hypot(e.clientX-drag.sx,e.clientY-drag.sy)<4)return;
+    drag.bmoved=true;drag.bubble.dx+=(e.clientX-drag.px)/cam.s;drag.bubble.dy+=(e.clientY-drag.py)/cam.s;
+    drag.px=e.clientX;drag.py=e.clientY;return;
+  }
+  if(drag.right&&!drag.moved&&Math.hypot(e.clientX-drag.sx,e.clientY-drag.sy)>=5)drag.moved=true;
+  if(drag.pan||(drag.right&&drag.moved)){cam.x-=(e.clientX-drag.px)/cam.s;cam.y-=(e.clientY-drag.py)/cam.s;drag.px=e.clientX;drag.py=e.clientY}
+  else if(!drag.right)apply(hover);
+});
+function endPtr(e){
+  ptrs.delete(e.pointerId);
+  if(drag&&drag.right&&!drag.moved)toggleActive(drag.c);
+  if(drag&&drag.bubble&&!drag.bmoved)openEditor(drag.bubble);
+  drag=null;
+}
+cv.addEventListener('pointerup',endPtr);
+cv.addEventListener('pointercancel',endPtr);
+cv.addEventListener('pointerleave',()=>{hover=null;dirty=true});
+cv.addEventListener('wheel',e=>{
+  e.preventDefault();
+  const before=toCell(e),r=cv.getBoundingClientRect();
+  const mx=e.clientX-r.left-W/2,my=e.clientY-r.top-H/2;
+  const wx=mx/cam.s+cam.x,wy=my/cam.s+cam.y;
+  cam.s=Math.min(120,Math.max(3,cam.s*Math.exp(-e.deltaY*0.0015)));
+  cam.x=wx-mx/cam.s;cam.y=wy-my/cam.s;dirty=true;
+},{passive:false});
+
+// controls
+const playBtn=document.getElementById('play'),speed=document.getElementById('speed');
+function tick(){if(!running)return;stepGen();timer=setTimeout(tick,1000/speed.value)}
+function setRunning(v){running=v;playBtn.textContent=v?'⏸ Pause':'▶ Play';clearTimeout(timer);if(v)tick()}
+playBtn.onclick=()=>setRunning(!running);
+document.getElementById('step').onclick=()=>{setRunning(false);stepGen()};
+document.getElementById('clear').onclick=()=>{setRunning(false);commitEditor(true);tiles.clear();comments.clear();gen=0;dirty=true;updateInfo()};
+document.getElementById('clearActive').onclick=()=>{for(const t of tiles.values())t.a=false;dirty=true;updateInfo()};
+document.querySelectorAll('#tools button').forEach(b=>b.onclick=()=>{
+  tool=b.dataset.tool;document.querySelectorAll('#tools button').forEach(x=>x.classList.toggle('on',x===b));
+  cv.style.cursor=tool==='pan'?'grab':'crosshair';dirty=true;
+});
+function setDir(d){dirMask=d;document.querySelectorAll('#dirs button').forEach(x=>x.classList.toggle('on',+x.dataset.d===d))}
+document.querySelectorAll('#dirs button').forEach(b=>b.onclick=()=>setDir(+b.dataset.d));
+addEventListener('keydown',e=>{
+  if(e.target&&e.target.id==='ced')return;
+  if(e.code==='Space'){e.preventDefault();spaceDown=true;cv.style.cursor='grab'}
+  else if(e.key==='ArrowUp'){e.preventDefault();setDir(U)}
+  else if(e.key==='ArrowDown'){e.preventDefault();setDir(D)}
+  else if(e.key==='ArrowLeft'){e.preventDefault();setDir(L)}
+  else if(e.key==='ArrowRight'){e.preventDefault();setDir(R)}
+  else if(e.ctrlKey||e.metaKey||e.altKey)return;
+  else if(e.key==='w'||e.key==='W')setDir(U);
+  else if(e.key==='s'||e.key==='S')setDir(D);
+  else if(e.key==='a'||e.key==='A')setDir(L);
+  else if(e.key==='d'||e.key==='D')setDir(R);
+  else if(e.key==='e'||e.key==='E')document.querySelector('#tools button[data-tool="erase"]').click();
+  else if(e.key==='q'||e.key==='Q')document.querySelector('#tools button[data-tool="draw"]').click();
+  else if(e.key==='c'||e.key==='C')document.querySelector('#tools button[data-tool="comment"]').click();
+  else if(e.key==='u'||e.key==='U')document.getElementById('export').click();
+  else if(e.key==='i'||e.key==='I')document.getElementById('import').click();
+  else if(e.key==='p'||e.key==='P')setRunning(!running);
+  else if(e.key==='n'||e.key==='N'){setRunning(false);stepGen()}
+});
+addEventListener('keyup',e=>{
+  if(e.target&&e.target.id==='ced')return;
+  if(e.code==='Space'){e.preventDefault();spaceDown=false;cv.style.cursor=tool==='pan'?'grab':'crosshair'}
+});
+
+// comment bubbles
+function wrapText(t,max){
+  const out=[];
+  for(const para of String(t||' ').split('\n')){
+    let line='';
+    for(const w of para.split(' ')){
+      const test=line?line+' '+w:w;
+      if(line&&ctx.measureText(test).width>max){out.push(line);line=w}else line=test;
+    }
+    out.push(line);
+  }
+  return out;
+}
+function bubbleAt(e){
+  const r=cv.getBoundingClientRect(),px=e.clientX-r.left,py=e.clientY-r.top;
+  for(let i=bubbles.length-1;i>=0;i--){const b=bubbles[i];if(px>=b.x&&px<=b.x+b.w&&py>=b.y&&py<=b.y+b.h)return b.c}
+  return null;
+}
+const ced=document.getElementById('ced');
+function openCommentAt(c){
+  const k=key(c.x,c.y);let cm=comments.get(k);
+  if(!cm){cm={x:c.x,y:c.y,dx:1,dy:-1,text:''};comments.set(k,cm)}
+  openEditor(cm);
+}
+function openEditor(c){
+  if(editing)commitEditor();
+  editing=c;
+  const ax=(c.x-cam.x)*cam.s+W/2+cam.s/2+c.dx*cam.s,ay=(c.y-cam.y)*cam.s+H/2+cam.s/2+c.dy*cam.s;
+  ced.value=c.text;ced.hidden=false;
+  ced.style.left=Math.max(4,Math.min(W-208,ax-100))+'px';
+  ced.style.top=Math.max(4,Math.min(H-80,ay-30))+'px';
+  setTimeout(()=>{ced.focus();ced.select()},0);
+  dirty=true;
+}
+function commitEditor(cancel){
+  if(!editing)return;
+  const c=editing;editing=null;
+  const t=ced.value.trim();
+  ced.hidden=true;
+  if(!cancel){if(t)c.text=t;else comments.delete(key(c.x,c.y))}
+  else if(!c.text)comments.delete(key(c.x,c.y));
+  dirty=true;
+}
+ced.addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();commitEditor()}
+  else if(e.key==='Escape'){e.preventDefault();commitEditor(true)}
+});
+ced.addEventListener('blur',()=>commitEditor());
+
+// import board from JSON
+function showMsg(t){document.getElementById('info').textContent=t;setTimeout(updateInfo,3500)}
+function importBoard(text){
+  let d;try{d=JSON.parse(text)}catch(e){return showMsg('Import failed: not valid JSON')}
+  if(!d||d.format!=='arrow-automaton'||!Array.isArray(d.supertiles))return showMsg('Import failed: unrecognized file');
+  const nt=new Map();
+  for(const s of d.supertiles){
+    if(!s||!Number.isInteger(s.x)||!Number.isInteger(s.y)||typeof s.tiles!=='string'||s.tiles.length!==64)return showMsg('Import failed: bad supertile');
+    const act=typeof s.active==='string'?s.active:'';
+    for(let i=0;i<64;i++){
+      const b=parseInt(s.tiles[i],16);
+      if(Number.isNaN(b))return showMsg('Import failed: bad hex digit');
+      if(!b)continue;
+      const m=((b&1)?U:0)|((b&2)?R:0)|((b&4)?D:0)|((b&8)?L:0);
+      nt.set(key(s.x*8+(i%8),s.y*8+(i>>3)),{m,a:act[i]==='1'});
+    }
+  }
+  const nc=new Map();
+  if(Array.isArray(d.comments))for(const c of d.comments){
+    if(c&&Number.isInteger(c.x)&&Number.isInteger(c.y)&&Number.isFinite(c.dx)&&Number.isFinite(c.dy)&&typeof c.text==='string'&&c.text)nc.set(key(c.x,c.y),{x:c.x,y:c.y,dx:c.dx,dy:c.dy,text:c.text});
+  }
+  commitEditor(true);
+  setRunning(false);tiles.clear();comments.clear();
+  for(const [k,v] of nt)tiles.set(k,v);
+  for(const [k,v] of nc)comments.set(k,v);
+  gen=0;
+  if(tiles.size){
+    let a=1e9,b=-1e9,c=1e9,e=-1e9;
+    for(const k of tiles.keys()){const [x,y]=k.split(',').map(Number);a=Math.min(a,x);b=Math.max(b,x);c=Math.min(c,y);e=Math.max(e,y)}
+    cam.x=(a+b+1)/2;cam.y=(c+e+1)/2;
+  }
+  dirty=true;updateInfo();showMsg('Imported '+tiles.size+' tiles');
+}
+const readFile=f=>{if(f)f.text().then(importBoard).catch(()=>showMsg('Import failed: could not read file'))};
+const fileIn=document.getElementById('file');
+document.getElementById('import').onclick=()=>fileIn.click();
+fileIn.onchange=()=>{readFile(fileIn.files[0]);fileIn.value=''};
+let dragDepth=0;
+const hasFiles=e=>e.dataTransfer&&Array.from(e.dataTransfer.types||[]).includes('Files');
+addEventListener('dragenter',e=>{if(!hasFiles(e))return;e.preventDefault();dragDepth++;document.body.classList.add('dragging')});
+addEventListener('dragover',e=>{if(!hasFiles(e))return;e.preventDefault();e.dataTransfer.dropEffect='copy'});
+addEventListener('dragleave',e=>{if(!hasFiles(e))return;dragDepth=Math.max(0,dragDepth-1);if(!dragDepth)document.body.classList.remove('dragging')});
+addEventListener('drop',e=>{
+  if(!hasFiles(e))return;
+  e.preventDefault();dragDepth=0;document.body.classList.remove('dragging');
+  readFile(e.dataTransfer.files[0]);
+});
+
+// export board as JSON
+(async()=>{
+  const btn=document.getElementById('export');
+  let dl=null;
+  try{dl=window.claude?await window.claude.use('downloads'):null}catch(e){dl=null}
+  btn.hidden=false;
+  btn.onclick=async()=>{
+    // 8x8 supertiles. Direction bits: up=1, right=2, down=4, left=8 (0 = no tile). Row-major, top row first.
+    const bitOf=m=>((m&U)?1:0)|((m&R)?2:0)|((m&D)?4:0)|((m&L)?8:0);
+    const st=new Map();
+    for(const [k,t] of tiles){
+      const [x,y]=k.split(',').map(Number);
+      const sx=Math.floor(x/8),sy=Math.floor(y/8),sk=sx+','+sy;
+      if(!st.has(sk))st.set(sk,{x:sx,y:sy,tiles:Array(64).fill('0'),active:Array(64).fill('0')});
+      const i=(y-sy*8)*8+(x-sx*8),s=st.get(sk);
+      s.tiles[i]=bitOf(t.m).toString(16);
+      s.active[i]=t.a?'1':'0';
+    }
+    const out={format:'arrow-automaton',version:1,supertiles:[...st.values()].map(s=>({x:s.x,y:s.y,tiles:s.tiles.join(''),active:s.active.join('')}))};
+    out.comments=[...comments.values()].map(c=>({x:c.x,y:c.y,dx:+c.dx.toFixed(2),dy:+c.dy.toFixed(2),text:c.text}));
+    const text=JSON.stringify(out,null,2);
+    if(!dl){
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(new Blob([text],{type:'application/json'}));
+      a.download='arrow-automaton-board.json';
+      document.body.appendChild(a);a.click();a.remove();
+      setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+      return;
+    }
+    try{await dl.save({filename:'arrow-automaton-board.json',data:text})}
+    catch(e){if(e&&e.code!=='declined')btn.textContent='Export unavailable'}
+  };
+})();
+
+// starter: a loop with one pulse circulating, plus a branching line
+function seed(){
+  for(let x=-3;x<=2;x++)tiles.set(key(x,-3),{m:R,a:false});
+  tiles.set(key(3,-3),{m:D,a:false});
+  for(let y=-2;y<=2;y++)tiles.set(key(3,y),{m:D,a:false});
+  tiles.set(key(3,3),{m:L,a:false});
+  for(let x=-3;x<=2;x++)tiles.set(key(x,3),{m:L,a:false});
+  tiles.set(key(-4,3),{m:U,a:false});
+  for(let y=-2;y<=2;y++)tiles.set(key(-4,y),{m:U,a:false});
+  tiles.set(key(-4,-3),{m:R,a:false});
+  tiles.get(key(-3,-3)).a=true;
+  // a fork that re-merges (double hit cancels)
+  tiles.set(key(5,0),{m:U|D|R,a:true});
+  tiles.set(key(5,-1),{m:R,a:false});tiles.set(key(5,1),{m:R,a:false});
+  tiles.set(key(6,-1),{m:D,a:false});tiles.set(key(6,1),{m:U,a:false});
+  tiles.set(key(6,0),{m:R,a:false});tiles.set(key(7,0),{m:R,a:false});
+  cam.x=.5;cam.y=0;
+}
+seed();resize();updateInfo();loop();
+</script>
+</body>
+</html>
